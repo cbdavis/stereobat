@@ -1,0 +1,115 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+Bat Bioacoustics
+========================================================
+
+Code based on documentation on https://revspace.nl/StereoBatRecorder
+
+Main steps:
+* A Butterworth filter is used to filter out low frequencies
+* The continuous spectral entropy is calculated as a means to separate parts of the signal containing possible bat calls from the rest of the signal
+* The lag between the left and right channels is calculated using the cross-covariance.  The absolute values of the hilbert transform of the correlations are then taken to smooth out a plot showing the correlation vs. time lag.
+
+Load the required libraries
+---------------------------
+```{r} 
+library(tuneR) #readWave
+library(seewave)
+library(signal) # Matlab-style filters
+library(ggplot2) # plotting
+```
+
+Spectrogram and amplitude plot of original signal
+-------------------------------------------------
+```{r fig.width=15, fig.height=12}
+originalWave = readMP3("/home/cbdavis/projects/BioAcoustics/Bats/stereobat/20130101/te173327.mp3")
+#originalWave = readMP3("/home/cbdavis/projects/BioAcoustics/Bats/stereobat/20130106/te185851.mp3")
+windowLength = 256
+specOriginal = spectro(originalWave, ovlp=50, scale=FALSE, osc=TRUE, norm=FALSE, wl=windowLength, plot=TRUE)
+```
+
+Define and apply Butterworth filter to original signal
+------------------------------------------------------
+```{r}
+tmp = butter(4, 0.2, "high")
+a = tmp$a
+b = tmp$b
+
+filteredWave = Wave(left = as.numeric(filter(b, a, originalWave@left)), 
+                    right = as.numeric(filter(b, a, originalWave@right)), 
+                    samp.rate = originalWave@samp.rate, 
+                    bit = originalWave@bit, 
+                    pcm = originalWave@pcm)
+```
+
+Spectrogram and amplitude plot of filtered signal
+-------------------------------------------------
+```{r fig.width=15, fig.height=12}
+specFiltered = spectro(filteredWave, ovlp=50, scale=FALSE, osc=TRUE, norm=FALSE, wl=windowLength, plot=TRUE)
+```
+
+Continuous Spectral Entropy of Signal
+-------------------------------------
+
+This is useful for segmenting the audio into regions of interest.  The cutoff value should be set more intelligently.  
+
+```{r fig.width=7, fig.height=5}
+cutoffValue = 0.9
+csh = csh(filteredWave, wl=windowLength, ovlp=0, plot=FALSE)
+csh_time = csh[,1]
+csh_values = csh[,2]
+plot.new()
+plot(csh_time, csh_values, type="l")
+abline(h = max(csh_values) * cutoffValue)
+```
+
+Now segment the audio based on the entropy values.  Use a time buffer before and after.
+```{r fig.width=7, fig.height=5}
+audioBuffer = 0.025
+audioSegments = list()
+locs = which(csh_values < max(csh_values) * cutoffValue)
+startLoc = locs[1]
+for (i in c(2:(length(locs)-1))){
+  if ((locs[i+1] - locs[i]) > 1){
+    endLoc = locs[i]
+    if ((endLoc - startLoc) > 5){ # TODO figure out a smarter way of figuring out if the signal is long enough
+      # cutw only returns a mono signal if a stereo signal is used as input, 
+      # so we perform cuts on both channels independently
+      print(paste("Audio segment from ", csh_time[startLoc]-audioBuffer, " to ", csh_time[endLoc] + audioBuffer, sep=""))
+      print("Left Channel Cut")
+      audioSegmentLeft = as.numeric(cutw(filteredWave@left, 
+                                         f=filteredWave@samp.rate,  
+                                         from=csh_time[startLoc]-audioBuffer, 
+                                         to=csh_time[endLoc] + audioBuffer, 
+                                         plot=TRUE, output="matrix"))
+      print("Right Channel Cut")
+      audioSegmentRight = as.numeric(cutw(filteredWave@right, 
+                                          f=filteredWave@samp.rate,  
+                                          from=csh_time[startLoc]-audioBuffer, 
+                                          to=csh_time[endLoc] + audioBuffer, 
+                                          plot=TRUE, output="matrix"))
+      audioSegment = Wave(audioSegmentLeft, audioSegmentRight, samp.rate = filteredWave@samp.rate, bit=filteredWave@bit)
+      audioSegments = c(audioSegments, audioSegment)
+      print("Left Channel Spectrogram")
+      spectro(audioSegment@left, f=audioSegment@samp.rate, ovlp=50, 
+              scale=FALSE, osc=FALSE, norm=FALSE, wl=windowLength, plot=TRUE)
+      print("Right Channel Spectrogram")
+      spectro(audioSegment@right, f=audioSegment@samp.rate, ovlp=50, 
+              scale=FALSE, osc=FALSE, norm=FALSE, wl=windowLength, plot=TRUE)
+      
+      # TODO lag.max is completely made up, should be set to something sensible based on max tdiff between microphones
+      xcov_info = ccf(audioSegment@left, audioSegment@right, lag.max=250, type="covariance", plot=FALSE)
+      lag = xcov_info$lag
+      r = xcov_info$acf
+      # take absolute value of the hilbert transform to get the envelope of the correlation
+      r2 = abs(hilbert(r, filteredWave@samp.rate))
+      print("Time Lag Between Left and Right Channels")
+      plot(lag*((1/audioSegment@samp.rate)*1000),r2, xlab="lag (ms)", type="l")
+      }
+    startLoc = locs[i+1]
+    }
+  }
+```
+
