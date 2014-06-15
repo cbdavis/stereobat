@@ -1,5 +1,5 @@
 ```{r setup, include=FALSE}
-#knitr::opts_chunk$set(cache=TRUE)
+#knitr::opts_chunk$set(cache=FALSE)
 ```
 
 Bat Bioacoustics
@@ -12,136 +12,166 @@ Main steps:
 * The continuous spectral entropy is calculated as a means to separate parts of the signal containing possible bat calls from the rest of the signal
 * The lag between the left and right channels is calculated using the cross-covariance.  The absolute values of the hilbert transform of the correlations are then taken to smooth out a plot showing the correlation vs. time lag.
 
+TODO:
+* The processing steps should be a bit more modular with tests showing how well they perform.  For example, the code that isolates the calls from the rest of the signal is ok, but could use a bit more work.
+* Try out a few ideas for species identification.
+
 Load the required libraries
 ---------------------------
 ```{r} 
+options(stringsAsFactors = FALSE) #never ever ever convert strings to factors
+
 library(tuneR) #readWave
+source("/home/cbdavis/Desktop/tuneR/R/readWave.R") # patched version of readWave
 library(seewave)
 library(signal) # Matlab-style filters
 library(ggplot2) # plotting
 library(sqldf) # run SQL queries over data frames
+
+baseDir = "/home/cbdavis/projects/BioAcoustics/Bats/stereobat"  # base directory for recordings, recursive search is done from here
 ```
 
-Spectrogram and amplitude plot of original signal
--------------------------------------------------
-```{r fig.width=15, fig.height=12}
-#originalWave = readMP3("/home/cbdavis/projects/BioAcoustics/Bats/stereobat/20130101/te173327.mp3")
-originalWave = readMP3("/home/cbdavis/projects/BioAcoustics/Bats/stereobat/20130106/te185851.mp3")
-windowLength = 256
-specOriginal = spectro(originalWave, ovlp=50, scale=FALSE, osc=TRUE, norm=FALSE, wl=windowLength, plot=TRUE)
-```
-
-Define and apply Butterworth filter to original signal
-------------------------------------------------------
+Define the Butterworth filter
+---------------------------
 ```{r}
-tmp = butter(4, 0.2, "high")
-a = tmp$a
-b = tmp$b
-
-filteredWave = Wave(left = as.numeric(filter(b, a, originalWave@left)), 
-                    right = as.numeric(filter(b, a, originalWave@right)), 
-                    samp.rate = originalWave@samp.rate, 
-                    bit = originalWave@bit, 
-                    pcm = originalWave@pcm)
+highPassFilter <- function(originalWave){
+  tmp = butter(4, 0.2, "high")
+  a = tmp$a
+  b = tmp$b
+  
+  filteredWave = Wave(left = as.numeric(filter(b, a, originalWave@left)), 
+                      right = as.numeric(filter(b, a, originalWave@right)), 
+                      samp.rate = originalWave@samp.rate, 
+                      bit = originalWave@bit, 
+                      pcm = originalWave@pcm)
+  return(filteredWave)
+}
 ```
 
-Spectrogram and amplitude plot of filtered signal
--------------------------------------------------
-```{r fig.width=15, fig.height=12}
-specFiltered = spectro(filteredWave, ovlp=50, scale=FALSE, osc=TRUE, norm=FALSE, wl=windowLength, plot=TRUE)
-```
+Process all recordings
+----------------------
+This iterates over all the files and uses the Continuous Spectral Entropy to segment calls from the rest of the signal.  For each of the segments, the time lag between the microphones is calculated.
+```{r}
+windowLength = 256
 
-Continuous Spectral Entropy of Signal
--------------------------------------
+files = list.files(path=baseDir, pattern="*.wav", recursive=TRUE, full.names=TRUE)
 
-This is useful for segmenting the audio into regions of interest.  The cutoff value should be set more intelligently.  
-
-```{r fig.width=7, fig.height=5}
-cutoffValue = 0.9
-csh = csh(filteredWave, wl=windowLength, ovlp=0, plot=FALSE)
-csh_time = csh[,1]
-csh_values = csh[,2]
-plot.new()
-plot(csh_time, csh_values, type="l")
-abline(h = max(csh_values) * cutoffValue)
-
-# in the seewave package, the autoc and fund functions should be helpful in refining this further.
-```
-
-Now segment the audio based on the entropy values.  Use a time buffer before and after.
-```{r fig.width=7, fig.height=5}
-lagData = NULL
-sampleCount = 1
-audioBuffer = 0.025
-audioSegments = list()
-locs = which(csh_values < max(csh_values) * cutoffValue)
-startLoc = locs[1]
-for (i in c(2:(length(locs)-1))){
-  if ((locs[i+1] - locs[i]) > 1){
-    endLoc = locs[i]
-    if ((endLoc - startLoc) > 5){ # TODO figure out a smarter way of figuring out if the signal is long enough
-      # cutw only returns a mono signal if a stereo signal is used as input, 
-      # so we perform cuts on both channels independently
-      
-      audioStart = csh_time[startLoc]-audioBuffer
-      audioEnd = csh_time[endLoc] + audioBuffer
-      
-        # make sure don't have negative starting value
+lagData = data.frame()
+entropy_df = data.frame()
+for (file in files){
+  originalWave = readWave(file)
+  filteredWave = highPassFilter(originalWave)
+  rm(originalWave)
+  
+  cutoffValue = 0.9
+  csh = csh(filteredWave, wl=windowLength, ovlp=0, plot=FALSE)
+  csh_time = csh[,1]
+  csh_values = csh[,2]
+  
+  # in the seewave package, the autoc and fund functions should be helpful in refining this further.
+  # The Continuous Spectral Entropy is ok, but still misses some parts and falsely identifies some parts of the signal
+  
+  entropy_df = rbind(entropy_df, 
+                     data.frame(fullPath = file, 
+                                csh_time = csh_time, 
+                                csh_values = csh_values, 
+                                csh_cutoff = max(csh_values) * cutoffValue))
+  
+  # Now segment the audio based on the entropy values.  Use a time buffer before and after.
+  sampleCount = 1
+  audioBuffer = 0.025
+  audioSegments = list()
+  locs = which(csh_values < max(csh_values) * cutoffValue)
+  startLoc = locs[1]
+  for (i in c(2:(length(locs)-1))){
+    if ((locs[i+1] - locs[i]) > 1){
+      endLoc = locs[i]
+      if ((endLoc - startLoc) > 5){ # TODO figure out a smarter way of figuring out if the signal is long enough
+        # cutw only returns a mono signal if a stereo signal is used as input, 
+        # so we perform cuts on both channels independently
+        
+        audioStart = csh_time[startLoc]-audioBuffer
+        
+        # make sure don't have negative starting value for the time
         if (audioStart < 0){
           audioStart = 0
+          }
+        
+        audioEnd = csh_time[endLoc] + audioBuffer
+        
+        # Turn on plot=TRUE to see way too many graphs
+        audioSegmentLeft = as.numeric(cutw(filteredWave@left, 
+                                           f=filteredWave@samp.rate,  
+                                           from=audioStart, 
+                                           to=audioEnd, 
+                                           plot=FALSE, output="matrix"))
+        audioSegmentRight = as.numeric(cutw(filteredWave@right, 
+                                            f=filteredWave@samp.rate,  
+                                            from=audioStart, 
+                                            to=audioEnd, 
+                                            plot=FALSE, output="matrix"))
+        audioSegment = Wave(audioSegmentLeft, audioSegmentRight, samp.rate = filteredWave@samp.rate, bit=filteredWave@bit)
+        audioSegments = c(audioSegments, audioSegment)
+        
+        # TODO lag.max is completely made up, should be set to something sensible based on max tdiff between microphones
+        xcov_info = ccf(audioSegment@left, audioSegment@right, lag.max=250, type="covariance", plot=FALSE)
+        lag = xcov_info$lag
+        r = xcov_info$acf
+        # take absolute value of the hilbert transform to get the envelope of the correlation
+        r2 = abs(hilbert(r, filteredWave@samp.rate))
+        # normalize r2
+        r2 = (r2 - min(r2))/(max(r2) - min(r2))
+        lagData = rbind(lagData, cbind(file, 
+                                       gsub(paste(baseDir, "/", sep=""), "", file), 
+                                       sampleCount, 
+                                       audioStart, 
+                                       audioEnd, 
+                                       lag*((1/audioSegment@samp.rate)*1000),
+                                       r2))
+        sampleCount = sampleCount + 1
         }
-
-      print(paste("Audio segment from ", audioStart, " to ", audioEnd, sep=""))
-      print("Left Channel Cut")
-      audioSegmentLeft = as.numeric(cutw(filteredWave@left, 
-                                         f=filteredWave@samp.rate,  
-                                         from=audioStart, 
-                                         to=audioEnd, 
-                                         plot=TRUE, output="matrix"))
-      print("Right Channel Cut")
-      audioSegmentRight = as.numeric(cutw(filteredWave@right, 
-                                          f=filteredWave@samp.rate,  
-                                          from=audioStart, 
-                                          to=audioEnd, 
-                                          plot=TRUE, output="matrix"))
-      audioSegment = Wave(audioSegmentLeft, audioSegmentRight, samp.rate = filteredWave@samp.rate, bit=filteredWave@bit)
-      audioSegments = c(audioSegments, audioSegment)
-      print("Left Channel Spectrogram")
-      spectro(audioSegment@left, f=audioSegment@samp.rate, ovlp=50, 
-              scale=FALSE, osc=FALSE, norm=FALSE, wl=windowLength, plot=TRUE)
-      print("Right Channel Spectrogram")
-      spectro(audioSegment@right, f=audioSegment@samp.rate, ovlp=50, 
-              scale=FALSE, osc=FALSE, norm=FALSE, wl=windowLength, plot=TRUE)
-      
-      # TODO lag.max is completely made up, should be set to something sensible based on max tdiff between microphones
-      xcov_info = ccf(audioSegment@left, audioSegment@right, lag.max=250, type="covariance", plot=FALSE)
-      lag = xcov_info$lag
-      r = xcov_info$acf
-      # take absolute value of the hilbert transform to get the envelope of the correlation
-      r2 = abs(hilbert(r, filteredWave@samp.rate))
-      print("Time Lag Between Left and Right Channels")
-      plot(lag*((1/audioSegment@samp.rate)*1000),r2, xlab="lag (ms)", type="l")
-      # normalize r2
-      r2 = (r2 - min(r2))/(max(r2) - min(r2))
-      lagData = rbind(lagData, cbind(sampleCount, audioStart, audioEnd, lag*((1/audioSegment@samp.rate)*1000),r2))
-      sampleCount = sampleCount + 1
+      startLoc = locs[i+1]
       }
-    startLoc = locs[i+1]
     }
   }
+
+entropy_df$relativePath = gsub(paste(baseDir, "/", sep=""), "", entropy_df$fullPath)
 ```
 
-Visualization of time lags between samples
-------------------------------------------
-The y values are normalized to 1.  What do the signals with really bad correlation signify?  Is this just noise?
+Continuous Spectral Entropy with Cutoff Value Used for Segmentation
+-------------------------------------------------------------------
+Parts of the audio signal with entropy values lower than the cutoff (in red) are kept for further analysis
+```{r fig.width=20, fig.height=20}
+ggplot(entropy_df, aes(x=csh_time, y=csh_values)) + geom_line() + 
+  geom_line(aes(x=csh_time, y=csh_cutoff, colour="red")) + 
+  facet_wrap(~relativePath)
+```
 
-```{r fig.width=5, fig.height=20}
-lagData = as.data.frame(lagData)
-colnames(lagData) = c("sample", "audioStart", "audioEnd", "lag", "r")
+Time Lag Between Microphone Channels
+------------------------------------
+Points indicate max correlation, with the correlation values scaled from 0 to 1 for plotting purposes.  The vertical semi-transparent lines are actually polygons, with the width representing the correlation at a particular lag value.
+```{r fig.width=20, fig.height=20}
+colnames(lagData) = c("fullPath", "relativePath", "sample", "audioStart", "audioEnd", "lag", "r")
 
-maxCorrelations = sqldf("select *, max(r) from lagData group by sample")
+lagData$audioStart = as.numeric(lagData$audioStart)
+lagData$audioEnd = as.numeric(lagData$audioEnd)
+lagData$r = as.numeric(lagData$r)
+lagData$lag = as.numeric(lagData$lag)
 
-ggplot(lagData) + geom_line(aes(x=lag, y=audioEnd+r, group=sample)) + 
-  geom_point(data=maxCorrelations, aes(x=lag, y=audioEnd+r))
+maxCorrelations = sqldf("select *, max(r) from lagData group by sample, fullPath")
 
+maxCorrelations$audioStart = as.numeric(maxCorrelations$audioStart)
+maxCorrelations$audioEnd = as.numeric(maxCorrelations$audioEnd)
+maxCorrelations$r = as.numeric(maxCorrelations$r)
+maxCorrelations$lag = as.numeric(maxCorrelations$lag)
+
+# set correlations for min & max lag (the boundaries of the window) to zero
+# this helps to draw the polygons correctly
+lagData$r[which(lagData$lag == max(lagData$lag))] = 0
+lagData$r[which(lagData$lag == min(lagData$lag))] = 0
+
+lagData = sqldf("select * from lagData order by fullPath, sample, lag")
+
+ggplot(lagData) + geom_line(aes(x=audioEnd+r, y=lag, group=sample), alpha=0.25) + 
+  geom_point(data=maxCorrelations, aes(x=audioEnd+r, y=lag)) + facet_wrap(~relativePath)
 ```
